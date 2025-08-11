@@ -19,7 +19,7 @@ SLEEP_SEC     = float(os.getenv("SLEEP_BETWEEN_ORDERS_SEC", "0.8"))
 POLL_SEC      = float(os.getenv("POLL_INTERVAL_SEC", "0.8"))
 POLL_TRIES    = int(os.getenv("POLL_MAX_TRIES", "25"))
 
-# Portfolio selection
+# Portfolio hints (used only for balance reads / debugging)
 PORTFOLIO_ID   = os.getenv("COINBASE_PORTFOLIO_ID") or ""
 PORTFOLIO_NAME = os.getenv("COINBASE_PORTFOLIO_NAME") or ""
 
@@ -182,32 +182,25 @@ def pick_portfolio_with_usd_if_needed() -> Optional[str]:
     if DEBUG_BALANCES:
         if best_usd > 0 and (configured != best_id):
             print(f"[BAL] Suggest using portfolio {best_id} (USD {best_usd}). "
-                  f"Set COINBASE_PORTFOLIO_ID={best_id} or move USD into your configured/default portfolio.")
-    # Still return the configured (or None) so we don’t place orders in a portfolio the key may not control.
-    return configured
+                  f"Move USD into your key’s portfolio or reissue the key for that portfolio.")
+    return configured  # orders always route to the portfolio tied to the API key
 
 
 # =========================
-# Orders & fills (with portfolio)
+# Orders & fills (NO portfolio_uuid)
 # =========================
-def place_buy(product_id: str, usd: float, portfolio_uuid: Optional[str]) -> str:
+def place_buy(product_id: str, usd: float) -> str:
     if DRY_RUN:
         return "DRYRUN"
-    params = dict(client_order_id="", product_id=product_id, quote_size=f"{usd:.2f}")
-    if portfolio_uuid:
-        params["portfolio_uuid"] = portfolio_uuid
-    o = CB.market_order_buy(**params)
+    o = CB.market_order_buy(client_order_id="", product_id=product_id, quote_size=f"{usd:.2f}")
     return g(o, "order_id", "id", default="")
 
-def poll_fills_sum(order_id: str, portfolio_uuid: Optional[str]) -> Dict[str, float]:
+def poll_fills_sum(order_id: str) -> Dict[str, float]:
     if DRY_RUN:
         return {"base_qty": 0.0, "fill_usd": 0.0}
     for _ in range(POLL_TRIES):
         try:
-            params = dict(order_id=order_id)
-            if portfolio_uuid:
-                params["portfolio_uuid"] = portfolio_uuid
-            f = CB.get_fills(**params)
+            f = CB.get_fills(order_id=order_id)  # no portfolio param allowed for orders
             fills = g(f, "fills") or (f if isinstance(f, list) else [])
             if fills:
                 base_qty = 0.0
@@ -266,10 +259,10 @@ def main():
     if DEBUG_BALANCES:
         debug_portfolios_and_usd()
 
-    # pick portfolio
+    # pick portfolio (for balance reads only — orders use the API key’s portfolio)
     portfolio_uuid = pick_portfolio_with_usd_if_needed()
 
-    # compute notional (from configured/default portfolio’s USD)
+    # compute notional from that portfolio’s USD
     usd_bal = usd_available_for_portfolio(portfolio_uuid)
     if DEBUG_BALANCES:
         print(f"[BAL] Using portfolio {portfolio_uuid or '(key default)'} with USD {usd_bal}")
@@ -284,8 +277,8 @@ def main():
                 logs.append([now_iso(), "CRYPTO-BUY-SKIP", pid, f"{notional:.2f}", "", "", "SKIPPED", note])
                 continue
 
-            oid = place_buy(pid, notional, portfolio_uuid)
-            fills = poll_fills_sum(oid, portfolio_uuid)
+            oid = place_buy(pid, notional)
+            fills = poll_fills_sum(oid)
             base_qty = fills["base_qty"]
             fill_usd = fills["fill_usd"] if fills["fill_usd"] > 0 else notional
 
