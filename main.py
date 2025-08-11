@@ -144,8 +144,26 @@ def resolve_portfolio_uuid() -> Optional[str]:
                 return p["id"]
     return None
 
+def debug_portfolios_and_usd():
+    """Print portfolio names + USD per portfolio (for troubleshooting)."""
+    try:
+        resp = CB.get_portfolios()
+        items = g(resp, "portfolios") or (resp if isinstance(resp, list) else [])
+    except Exception as e:
+        print(f"[PORT] error listing portfolios: {e}")
+        items = []
+
+    usd_default = usd_available_for_portfolio(None)
+    print(f"[PORT] (key default) USD={usd_default}")
+
+    for p in items:
+        pid  = (g(p, "uuid", "id", "portfolio_uuid") or "").strip()
+        name = (g(p, "name", "portfolio_name") or "").strip() or "(unnamed)"
+        usd  = usd_available_for_portfolio(pid)
+        print(f"[PORT] {name} id={pid} USD={usd}")
+
 def pick_portfolio_with_usd_if_needed() -> Optional[str]:
-    """If configured portfolio has $0, scan others and suggest one with USD."""
+    """Return configured portfolio id (or None for default). Prints suggestion if another portfolio has USD."""
     configured = resolve_portfolio_uuid()
     usd_cfg = usd_available_for_portfolio(configured)
     if usd_cfg > 0:
@@ -165,7 +183,7 @@ def pick_portfolio_with_usd_if_needed() -> Optional[str]:
         if best_usd > 0 and (configured != best_id):
             print(f"[BAL] Suggest using portfolio {best_id} (USD {best_usd}). "
                   f"Set COINBASE_PORTFOLIO_ID={best_id} or move USD into your configured/default portfolio.")
-    # We still return the configured (or None) so orders don’t target a portfolio your key might not control.
+    # Still return the configured (or None) so we don’t place orders in a portfolio the key may not control.
     return configured
 
 
@@ -244,6 +262,9 @@ def main():
     if not products:
         print("ℹ️ No products in screener; exiting.")
         return
+
+    if DEBUG_BALANCES:
+        debug_portfolios_and_usd()
 
     # pick portfolio
     portfolio_uuid = pick_portfolio_with_usd_if_needed()
