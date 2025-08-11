@@ -1,6 +1,6 @@
 import os, json, time
 from datetime import datetime, timezone
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional
 
 import gspread
 from coinbase.rest import RESTClient
@@ -19,6 +19,11 @@ SLEEP_SEC     = float(os.getenv("SLEEP_BETWEEN_ORDERS_SEC", "0.8"))
 POLL_SEC      = float(os.getenv("POLL_INTERVAL_SEC", "0.8"))
 POLL_TRIES    = int(os.getenv("POLL_MAX_TRIES", "25"))
 
+# Portfolio selection
+PORTFOLIO_ID   = os.getenv("COINBASE_PORTFOLIO_ID") or ""
+PORTFOLIO_NAME = os.getenv("COINBASE_PORTFOLIO_NAME") or ""
+
+# Debug / safety
 DRY_RUN         = os.getenv("DRY_RUN", "").lower() in ("1","true","yes")
 DEBUG_BALANCES  = os.getenv("DEBUG_BALANCES", "").lower() in ("1","true","yes")
 
@@ -43,23 +48,20 @@ def g(obj: Any, *names: str, default=None):
                 return v
     return default
 
+def norm_str(x) -> str:
+    if x is None: return ""
+    return str(x)
+
 def norm_ccy(c) -> str:
-    """Normalize a currency field that might be a string or an object."""
-    if c is None:
-        return ""
-    if isinstance(c, str):
-        return c.upper()
+    if c is None: return ""
+    if isinstance(c, str): return c.upper()
     return (g(c, "code", "currency", "symbol", "base", default="") or "").upper()
 
 def norm_amount(x) -> float:
-    """Normalize an amount that might be str/number or an object with .value/.amount."""
-    if x is None:
-        return 0.0
+    if x is None: return 0.0
     if isinstance(x, (int, float, str)):
-        try:
-            return float(x)
-        except:
-            return 0.0
+        try: return float(x)
+        except: return 0.0
     return float(g(x, "value", "amount", default=0.0) or 0.0)
 
 def get_gc():
@@ -88,10 +90,7 @@ def read_screener(ws) -> List[str]:
     if not values or len(values) < 2:
         return []
     header = [h.strip() for h in values[0]]
-    try:
-        idx = header.index("Product")
-    except ValueError:
-        idx = 0
+    idx = header.index("Product") if "Product" in header else 0
     out, seen = [], set()
     for r in values[1:]:
         if idx < len(r):
@@ -102,39 +101,95 @@ def read_screener(ws) -> List[str]:
 
 
 # =========================
-# Coinbase helpers
+# Coinbase – portfolios & balances
 # =========================
-def get_usd_available() -> float:
-    """Sum available USD across accounts (object/dict safe)."""
-    acc = CB.get_accounts()
+def list_portfolios() -> List[Dict[str, str]]:
+    """Return list of {'id':..., 'name':...} for portfolios visible to this API key."""
+    resp = CB.get_portfolios()
+    items = g(resp, "portfolios") or (resp if isinstance(resp, list) else [])
+    out = []
+    for p in items:
+        pid = norm_str(g(p, "uuid", "id", "portfolio_uuid"))
+        name = norm_str(g(p, "name", "portfolio_name"))
+        if pid:
+            out.append({"id": pid, "name": name})
+    return out
+
+def accounts_for_portfolio(portfolio_uuid: Optional[str] = None):
+    if portfolio_uuid:
+        return CB.get_accounts(portfolio_uuid=portfolio_uuid)
+    return CB.get_accounts()
+
+def usd_available_for_portfolio(portfolio_uuid: Optional[str]) -> float:
+    acc = accounts_for_portfolio(portfolio_uuid)
     accounts = g(acc, "accounts") or (acc if isinstance(acc, list) else [])
     usd_total = 0.0
-
     for a in accounts:
-        ccy_code = norm_ccy(g(a, "currency", "currency_symbol", "asset", "currency_code"))
-        avail    = norm_amount(g(a, "available_balance", "available", "balance", "available_balance_value"))
-        if DEBUG_BALANCES:
-            print(f"[BAL] {ccy_code}: {avail}")
-        if ccy_code == "USD":
+        ccy = norm_ccy(g(a, "currency", "currency_symbol", "asset", "currency_code"))
+        avail = norm_amount(g(a, "available_balance", "available", "balance", "available_balance_value"))
+        if ccy == "USD":
             usd_total += avail
-
     if DEBUG_BALANCES:
-        print(f"[BAL] USD available total = {usd_total}")
+        label = portfolio_uuid or "(key default)"
+        print(f"[BAL] Portfolio {label}: USD {usd_total}")
     return usd_total
 
-def place_buy(product_id: str, usd: float) -> str:
+def resolve_portfolio_uuid() -> Optional[str]:
+    # Priority: explicit ID → name match → (None = use key’s default)
+    if PORTFOLIO_ID:
+        return PORTFOLIO_ID
+    if PORTFOLIO_NAME:
+        for p in list_portfolios():
+            if p["name"].strip().lower() == PORTFOLIO_NAME.strip().lower():
+                return p["id"]
+    return None
+
+def pick_portfolio_with_usd_if_needed() -> Optional[str]:
+    """If configured portfolio has $0, scan others and suggest one with USD."""
+    configured = resolve_portfolio_uuid()
+    usd_cfg = usd_available_for_portfolio(configured)
+    if usd_cfg > 0:
+        return configured
+    # scan others
+    try:
+        ports = list_portfolios()
+    except Exception:
+        ports = []
+    best_id, best_usd = None, 0.0
+    for p in ports:
+        pid = p["id"]
+        usd = usd_available_for_portfolio(pid)
+        if usd > best_usd:
+            best_id, best_usd = pid, usd
+    if DEBUG_BALANCES:
+        if best_usd > 0 and (configured != best_id):
+            print(f"[BAL] Suggest using portfolio {best_id} (USD {best_usd}). "
+                  f"Set COINBASE_PORTFOLIO_ID={best_id} or move USD into your configured/default portfolio.")
+    # We still return the configured (or None) so orders don’t target a portfolio your key might not control.
+    return configured
+
+
+# =========================
+# Orders & fills (with portfolio)
+# =========================
+def place_buy(product_id: str, usd: float, portfolio_uuid: Optional[str]) -> str:
     if DRY_RUN:
         return "DRYRUN"
-    o = CB.market_order_buy(client_order_id="", product_id=product_id, quote_size=f"{usd:.2f}")
+    params = dict(client_order_id="", product_id=product_id, quote_size=f"{usd:.2f}")
+    if portfolio_uuid:
+        params["portfolio_uuid"] = portfolio_uuid
+    o = CB.market_order_buy(**params)
     return g(o, "order_id", "id", default="")
 
-def poll_fills_sum(order_id: str) -> Dict[str, float]:
-    """Poll fills; return {'base_qty':..., 'fill_usd':...} (best-effort)."""
+def poll_fills_sum(order_id: str, portfolio_uuid: Optional[str]) -> Dict[str, float]:
     if DRY_RUN:
         return {"base_qty": 0.0, "fill_usd": 0.0}
     for _ in range(POLL_TRIES):
         try:
-            f = CB.get_fills(order_id=order_id)
+            params = dict(order_id=order_id)
+            if portfolio_uuid:
+                params["portfolio_uuid"] = portfolio_uuid
+            f = CB.get_fills(**params)
             fills = g(f, "fills") or (f if isinstance(f, list) else [])
             if fills:
                 base_qty = 0.0
@@ -155,6 +210,10 @@ def poll_fills_sum(order_id: str) -> Dict[str, float]:
         time.sleep(POLL_SEC)
     return {"base_qty": 0.0, "fill_usd": 0.0}
 
+
+# =========================
+# Sheet helpers (cost basis)
+# =========================
 def upsert_cost(ws, product: str, add_qty: float, add_cost: float):
     vals = ws.get_all_values()
     if vals and len(vals) > 1:
@@ -186,20 +245,26 @@ def main():
         print("ℹ️ No products in screener; exiting.")
         return
 
+    # pick portfolio
+    portfolio_uuid = pick_portfolio_with_usd_if_needed()
+
+    # compute notional (from configured/default portfolio’s USD)
+    usd_bal = usd_available_for_portfolio(portfolio_uuid)
+    if DEBUG_BALANCES:
+        print(f"[BAL] Using portfolio {portfolio_uuid or '(key default)'} with USD {usd_bal}")
+
     logs = []
     for i, pid in enumerate(products, 1):
         try:
-            usd_bal = get_usd_available()
             notional = usd_bal * (PCT_PER_TRADE / 100.0)
-
             if notional < MIN_NOTIONAL:
                 note = f"Notional ${notional:.2f} < ${MIN_NOTIONAL:.2f}"
                 print(f"⚠️ {pid} {note}")
                 logs.append([now_iso(), "CRYPTO-BUY-SKIP", pid, f"{notional:.2f}", "", "", "SKIPPED", note])
                 continue
 
-            oid = place_buy(pid, notional)
-            fills = poll_fills_sum(oid)
+            oid = place_buy(pid, notional, portfolio_uuid)
+            fills = poll_fills_sum(oid, portfolio_uuid)
             base_qty = fills["base_qty"]
             fill_usd = fills["fill_usd"] if fills["fill_usd"] > 0 else notional
 
