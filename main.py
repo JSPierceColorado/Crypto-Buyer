@@ -5,6 +5,9 @@ from typing import List, Any, Dict
 import gspread
 from coinbase.rest import RESTClient
 
+# =========================
+# Config (env or defaults)
+# =========================
 SHEET_NAME   = os.getenv("SHEET_NAME", "Trading Log")
 SCREENER_TAB = os.getenv("CRYPTO_SCREENER_TAB", "crypto_screener")
 LOG_TAB      = os.getenv("CRYPTO_LOG_TAB", "crypto_log")
@@ -15,12 +18,18 @@ MIN_NOTIONAL  = float(os.getenv("MIN_ORDER_NOTIONAL", "1.00"))
 SLEEP_SEC     = float(os.getenv("SLEEP_BETWEEN_ORDERS_SEC", "0.8"))
 POLL_SEC      = float(os.getenv("POLL_INTERVAL_SEC", "0.8"))
 POLL_TRIES    = int(os.getenv("POLL_MAX_TRIES", "25"))
-DRY_RUN       = os.getenv("DRY_RUN", "").lower() in ("1","true","yes")
+
+DRY_RUN         = os.getenv("DRY_RUN", "").lower() in ("1","true","yes")
+DEBUG_BALANCES  = os.getenv("DEBUG_BALANCES", "").lower() in ("1","true","yes")
 
 CB = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET
 
-# ---------- utils ----------
-def now_iso(): return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+# =========================
+# Utils
+# =========================
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def g(obj: Any, *names: str, default=None):
     """Get first present attr/key from an object or dict."""
@@ -34,6 +43,25 @@ def g(obj: Any, *names: str, default=None):
                 return v
     return default
 
+def norm_ccy(c) -> str:
+    """Normalize a currency field that might be a string or an object."""
+    if c is None:
+        return ""
+    if isinstance(c, str):
+        return c.upper()
+    return (g(c, "code", "currency", "symbol", "base", default="") or "").upper()
+
+def norm_amount(x) -> float:
+    """Normalize an amount that might be str/number or an object with .value/.amount."""
+    if x is None:
+        return 0.0
+    if isinstance(x, (int, float, str)):
+        try:
+            return float(x)
+        except:
+            return 0.0
+    return float(g(x, "value", "amount", default=0.0) or 0.0)
+
 def get_gc():
     raw = os.getenv("GOOGLE_CREDS_JSON")
     if not raw:
@@ -42,7 +70,8 @@ def get_gc():
 
 def _ws(gc, tab):
     sh = gc.open(SHEET_NAME)
-    try: return sh.worksheet(tab)
+    try:
+        return sh.worksheet(tab)
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=tab, rows="2000", cols="50")
 
@@ -55,33 +84,43 @@ def ensure_cost(ws):
         ws.append_row(["Product","Qty","DollarCost","AvgCostUSD","UpdatedAt"])
 
 def read_screener(ws) -> List[str]:
-    vals = ws.get_all_values()
-    if not vals or len(vals) < 2: return []
-    hdr = [h.strip() for h in vals[0]]
-    i = hdr.index("Product") if "Product" in hdr else 0
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return []
+    header = [h.strip() for h in values[0]]
+    try:
+        idx = header.index("Product")
+    except ValueError:
+        idx = 0
     out, seen = [], set()
-    for r in vals[1:]:
-        if i < len(r):
-            pid = r[i].strip().upper()
+    for r in values[1:]:
+        if idx < len(r):
+            pid = r[idx].strip().upper()
             if pid and pid not in seen:
                 seen.add(pid); out.append(pid)
     return out
 
-# ---------- coinbase helpers ----------
+
+# =========================
+# Coinbase helpers
+# =========================
 def get_usd_available() -> float:
-    """Return available USD balance using object/dict-safe access."""
+    """Sum available USD across accounts (object/dict safe)."""
     acc = CB.get_accounts()
     accounts = g(acc, "accounts") or (acc if isinstance(acc, list) else [])
+    usd_total = 0.0
+
     for a in accounts:
-        ccy = g(a, "currency", "currency_symbol")
-        if ccy == "USD":
-            bal = g(a, "available_balance")
-            val = g(bal, "value") if bal is not None else None
-            try:
-                return float(val or 0.0)
-            except:
-                return 0.0
-    return 0.0
+        ccy_code = norm_ccy(g(a, "currency", "currency_symbol", "asset", "currency_code"))
+        avail    = norm_amount(g(a, "available_balance", "available", "balance", "available_balance_value"))
+        if DEBUG_BALANCES:
+            print(f"[BAL] {ccy_code}: {avail}")
+        if ccy_code == "USD":
+            usd_total += avail
+
+    if DEBUG_BALANCES:
+        print(f"[BAL] USD available total = {usd_total}")
+    return usd_total
 
 def place_buy(product_id: str, usd: float) -> str:
     if DRY_RUN:
@@ -93,28 +132,28 @@ def poll_fills_sum(order_id: str) -> Dict[str, float]:
     """Poll fills; return {'base_qty':..., 'fill_usd':...} (best-effort)."""
     if DRY_RUN:
         return {"base_qty": 0.0, "fill_usd": 0.0}
-    base_qty = 0.0; fill_usd = 0.0
     for _ in range(POLL_TRIES):
         try:
             f = CB.get_fills(order_id=order_id)
             fills = g(f, "fills") or (f if isinstance(f, list) else [])
             if fills:
-                bsum = 0.0; qsum = 0.0
+                base_qty = 0.0
+                fill_usd = 0.0
                 for x in fills:
-                    size = float(g(x, "size", "filled_quantity", default=0) or 0)
-                    qv   = g(x, "quote_value", "commissionable_value")
+                    sz = float(g(x, "size", "filled_quantity", default=0) or 0)
+                    qv = g(x, "quote_value", "commissionable_value")
                     if qv is not None:
-                        qsum += float(qv)
+                        fill_usd += float(qv)
                     else:
                         px = float(g(x, "price", default=0) or 0)
-                        qsum += px * size
-                    bsum += size
-                if bsum > 0 and qsum > 0:
-                    return {"base_qty": bsum, "fill_usd": qsum}
+                        fill_usd += px * sz
+                    base_qty += sz
+                if base_qty > 0 and fill_usd > 0:
+                    return {"base_qty": base_qty, "fill_usd": fill_usd}
         except Exception:
             pass
         time.sleep(POLL_SEC)
-    return {"base_qty": base_qty, "fill_usd": fill_usd}
+    return {"base_qty": 0.0, "fill_usd": 0.0}
 
 def upsert_cost(ws, product: str, add_qty: float, add_cost: float):
     vals = ws.get_all_values()
@@ -131,7 +170,10 @@ def upsert_cost(ws, product: str, add_qty: float, add_cost: float):
     avg = (add_cost / add_qty) if add_qty > 0 else 0.0
     ws.append_row([product, f"{add_qty:.12f}", f"{add_cost:.2f}", f"{avg:.6f}", now_iso()])
 
-# ---------- main ----------
+
+# =========================
+# Main
+# =========================
 def main():
     print("🛒 crypto-buyer starting")
     gc = get_gc()
@@ -149,6 +191,7 @@ def main():
         try:
             usd_bal = get_usd_available()
             notional = usd_bal * (PCT_PER_TRADE / 100.0)
+
             if notional < MIN_NOTIONAL:
                 note = f"Notional ${notional:.2f} < ${MIN_NOTIONAL:.2f}"
                 print(f"⚠️ {pid} {note}")
@@ -157,9 +200,10 @@ def main():
 
             oid = place_buy(pid, notional)
             fills = poll_fills_sum(oid)
-            base_qty = fills["base_qty"]; fill_usd = fills["fill_usd"] if fills["fill_usd"] > 0 else notional
+            base_qty = fills["base_qty"]
+            fill_usd = fills["fill_usd"] if fills["fill_usd"] > 0 else notional
 
-            status = "submitted" if not DRY_RUN else "dry-run"
+            status = "dry-run" if DRY_RUN else "submitted"
             print(f"✅ BUY {pid} ${notional:.2f} (order {oid}, {status})")
             logs.append([now_iso(), "CRYPTO-BUY", pid, f"{notional:.2f}", f"{base_qty:.12f}" if base_qty else "", oid, status, ""])
 
@@ -176,6 +220,7 @@ def main():
     for i in range(0, len(logs), 100):
         ws_log.append_rows(logs[i:i+100], value_input_option="USER_ENTERED")
     print("✅ crypto-buyer done")
+
 
 if __name__ == "__main__":
     try:
