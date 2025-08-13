@@ -29,7 +29,7 @@ CB = RESTClient()
 getcontext().prec = 28
 getcontext().rounding = ROUND_DOWN
 
-# ---------- Headers (match finder) ----------
+# ---------- Headers ----------
 LOG_HEADERS       = ["Timestamp","Action","Product","QuoteUSD","BaseQty","OrderID","Status","Note"]
 LOG_TABLE_RANGE   = "A1:H1"
 COST_HEADERS      = ["Product","Qty","DollarCost","AvgCostUSD","UpdatedAt"]
@@ -49,6 +49,19 @@ def g(obj: Any, *names: str, default=None):
                 return v
     return default
 
+def norm_ccy(c) -> str:
+    if c is None: return ""
+    if isinstance(c, str): return c.upper()
+    return (g(c, "code", "currency", "symbol", "asset", "base", default="") or "").upper()
+
+def norm_amount(x) -> float:
+    if x is None: return 0.0
+    if isinstance(x, (int, float, str)):
+        try: return float(x)
+        except: return 0.0
+    # Coinbase often returns {"value":"123.45","currency":"USD"}
+    return float(g(x, "value", "amount", default=0.0) or 0.0)
+
 def _parse_num(x) -> float:
     if isinstance(x, (int, float)): return float(x)
     s = (x or "").strip().replace(",", "").replace("$", "")
@@ -66,7 +79,6 @@ def _ws(gc, tab):
     sh = gc.open(SHEET_NAME)
     try: return sh.worksheet(tab)
     except gspread.WorksheetNotFound:
-        # the finder should have created these; as a safeguard, create + header
         ws = sh.add_worksheet(title=tab, rows="2000", cols="50")
         if tab == LOG_TAB:
             ws.update(range_name="A1:H1", values=[LOG_HEADERS])
@@ -147,11 +159,13 @@ def usd_available_for_portfolio(portfolio_uuid: Optional[str]) -> float:
     accounts = g(acc, "accounts") or (acc if isinstance(acc, list) else [])
     usd_total = 0.0
     for a in accounts:
-        ccy = (g(a, "currency", "currency_symbol", "asset", "currency_code") or "").upper()
-        avail = float(g(a, "available_balance", "available", "balance", "available_balance_value") or 0)
-        if ccy == "USD": usd_total += avail
+        ccy = norm_ccy(g(a, "currency", "currency_symbol", "asset", "currency_code"))
+        avail = norm_amount(g(a, "available_balance", "available", "balance", "available_balance_value"))
+        if ccy == "USD":
+            usd_total += avail
     if DEBUG_BALANCES:
-        print(f"[BAL] Portfolio {portfolio_uuid or '(key default)'} USD={usd_total}")
+        label = portfolio_uuid or "(key default)"
+        print(f"[BAL] Portfolio {label}: USD {usd_total}")
     return usd_total
 
 def resolve_portfolio_uuid() -> Optional[str]:
