@@ -11,6 +11,7 @@ SHEET_NAME   = os.getenv("SHEET_NAME", "Trading Log")
 SCREENER_TAB = os.getenv("CRYPTO_SCREENER_TAB", "crypto_screener")
 LOG_TAB      = os.getenv("CRYPTO_LOG_TAB", "crypto_log")
 COST_TAB     = os.getenv("CRYPTO_COST_TAB", "crypto_cost")
+ENABLE_COST_SHEET = os.getenv("ENABLE_COST_SHEET", "false").lower() in ("1","true","yes")
 
 PCT_PER_TRADE = float(os.getenv("PERCENT_PER_TRADE", "5.0"))
 MIN_NOTIONAL  = float(os.getenv("MIN_ORDER_NOTIONAL", "1.00"))
@@ -20,24 +21,21 @@ POLL_TRIES    = int(os.getenv("POLL_MAX_TRIES", "25"))
 
 PORTFOLIO_ID   = os.getenv("COINBASE_PORTFOLIO_ID") or ""
 PORTFOLIO_NAME = os.getenv("COINBASE_PORTFOLIO_NAME") or ""
-
 DRY_RUN         = os.getenv("DRY_RUN", "").lower() in ("1","true","yes")
 DEBUG_BALANCES  = os.getenv("DEBUG_BALANCES", "").lower() in ("1","true","yes")
 
 CB = RESTClient()
-
 getcontext().prec = 28
 getcontext().rounding = ROUND_DOWN
 
 # ---------- Headers ----------
-LOG_HEADERS       = ["Timestamp","Action","Product","QuoteUSD","BaseQty","OrderID","Status","Note"]
-LOG_TABLE_RANGE   = "A1:H1"
-COST_HEADERS      = ["Product","Qty","DollarCost","AvgCostUSD","UpdatedAt"]
-COST_TABLE_RANGE  = "A1:E1"
+LOG_HEADERS  = ["Timestamp","Action","Product","QuoteUSD","BaseQty","OrderID","Status","Note"]
+COST_HEADERS = ["Product","Qty","DollarCost","AvgCostUSD","UpdatedAt"]
+LOG_TABLE_RANGE  = "A1:H1"
+COST_TABLE_RANGE = "A1:E1"
 
 # ---------- Utils ----------
 def now_iso() -> str: return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 def g(obj: Any, *names: str, default=None):
     for n in names:
         if isinstance(obj, dict):
@@ -48,20 +46,16 @@ def g(obj: Any, *names: str, default=None):
             if v not in (None, ""):
                 return v
     return default
-
 def norm_ccy(c) -> str:
     if c is None: return ""
     if isinstance(c, str): return c.upper()
     return (g(c, "code", "currency", "symbol", "asset", "base", default="") or "").upper()
-
 def norm_amount(x) -> float:
     if x is None: return 0.0
     if isinstance(x, (int, float, str)):
         try: return float(x)
         except: return 0.0
-    # Coinbase often returns {"value":"123.45","currency":"USD"}
     return float(g(x, "value", "amount", default=0.0) or 0.0)
-
 def _parse_num(x) -> float:
     if isinstance(x, (int, float)): return float(x)
     s = (x or "").strip().replace(",", "").replace("$", "")
@@ -75,19 +69,27 @@ def get_gc():
     if not raw: raise RuntimeError("Missing GOOGLE_CREDS_JSON")
     return gspread.service_account_from_dict(json.loads(raw))
 
-def _ws(gc, tab):
+def _ws(gc, tab, create_if_missing=True):
     sh = gc.open(SHEET_NAME)
-    try: return sh.worksheet(tab)
+    try:
+        return sh.worksheet(tab)
     except gspread.WorksheetNotFound:
+        if not create_if_missing:
+            return None
         ws = sh.add_worksheet(title=tab, rows="2000", cols="50")
         if tab == LOG_TAB:
             ws.update(range_name="A1:H1", values=[LOG_HEADERS])
-        elif tab == COST_TAB:
+            try: ws.freeze(rows=1)
+            except Exception: pass
+        if tab == COST_TAB:
             ws.update(range_name="A1:E1", values=[COST_HEADERS])
+            try: ws.freeze(rows=1)
+            except Exception: pass
         return ws
 
 # ---------- Sheet helpers ----------
 def ensure_log(ws):
+    if not ws: return
     vals = ws.get_values("A1:H1")
     if not vals or vals[0] != LOG_HEADERS:
         ws.update(range_name="A1:H1", values=[LOG_HEADERS])
@@ -95,6 +97,7 @@ def ensure_log(ws):
     except Exception: pass
 
 def ensure_cost(ws):
+    if not ws: return
     vals = ws.get_values("A1:E1")
     if not vals or vals[0] != COST_HEADERS:
         ws.update(range_name="A1:E1", values=[COST_HEADERS])
@@ -102,6 +105,7 @@ def ensure_cost(ws):
     except Exception: pass
 
 def append_logs(ws, rows: List[List[str]]):
+    if not ws or not rows: return
     fixed = []
     for r in rows:
         if len(r) < 8:   r += [""] * (8 - len(r))
@@ -115,6 +119,7 @@ def append_logs(ws, rows: List[List[str]]):
         ws.update(f"A{start}:H{start+len(fixed)-1}", fixed, value_input_option="RAW")
 
 def append_cost_rows(ws, rows: List[List[str]]):
+    if not ws or not rows: return
     fixed = []
     for r in rows:
         if len(r) < 5:   r += [""] * (5 - len(r))
@@ -161,8 +166,7 @@ def usd_available_for_portfolio(portfolio_uuid: Optional[str]) -> float:
     for a in accounts:
         ccy = norm_ccy(g(a, "currency", "currency_symbol", "asset", "currency_code"))
         avail = norm_amount(g(a, "available_balance", "available", "balance", "available_balance_value"))
-        if ccy == "USD":
-            usd_total += avail
+        if ccy == "USD": usd_total += avail
     if DEBUG_BALANCES:
         label = portfolio_uuid or "(key default)"
         print(f"[BAL] Portfolio {label}: USD {usd_total}")
@@ -242,6 +246,7 @@ def poll_fills_sum(order_id: str) -> Dict[str, float]:
 
 # ---------- Cost basis sheet ----------
 def upsert_cost(ws, product: str, add_qty: float, add_cost: float):
+    if not ws: return
     vals = ws.get_all_values()
     if vals and len(vals) > 1:
         for r in range(1, len(vals)):
@@ -264,7 +269,8 @@ def main():
     gc = get_gc()
     ws_scr  = _ws(gc, SCREENER_TAB)
     ws_log  = _ws(gc, LOG_TAB);  ensure_log(ws_log)
-    ws_cost = _ws(gc, COST_TAB); ensure_cost(ws_cost)
+    ws_cost = _ws(gc, COST_TAB, create_if_missing=ENABLE_COST_SHEET) if ENABLE_COST_SHEET else None
+    ensure_cost(ws_cost)
 
     products = read_screener(ws_scr)
     if not products:
@@ -276,9 +282,7 @@ def main():
     if DEBUG_BALANCES:
         print(f"[BAL] Using portfolio {portfolio_uuid or '(key default)'} with USD {usd_bal}")
 
-    remaining_usd = usd_bal
-    logs = []
-
+    remaining_usd, logs = usd_bal, []
     for pid in products:
         try:
             notional = remaining_usd * (PCT_PER_TRADE / 100.0)
@@ -301,7 +305,7 @@ def main():
                          f"{base_qty:.12f}" if base_qty else "", oid, status, ""])
             print(f"✅ BUY {pid} ${notional:.2f} (order {oid}, {status})")
 
-            if not DRY_RUN and base_qty > 0 and fill_usd > 0:
+            if ENABLE_COST_SHEET and (not DRY_RUN) and base_qty > 0 and fill_usd > 0:
                 upsert_cost(ws_cost, pid, base_qty, fill_usd)
 
             time.sleep(SLEEP_SEC * (0.8 + 0.4 * random.random()))
