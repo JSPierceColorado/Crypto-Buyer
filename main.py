@@ -1,4 +1,4 @@
-import os, json, time
+import os, json, time, random
 from datetime import datetime, timezone
 from typing import List, Any, Dict, Optional
 
@@ -28,6 +28,14 @@ DRY_RUN         = os.getenv("DRY_RUN", "").lower() in ("1","true","yes")
 DEBUG_BALANCES  = os.getenv("DEBUG_BALANCES", "").lower() in ("1","true","yes")
 
 CB = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET
+
+# =========================
+# Sheet layout anchors
+# =========================
+LOG_HEADERS       = ["Timestamp","Action","Product","QuoteUSD","BaseQty","OrderID","Status","Note"]
+LOG_TABLE_RANGE   = "A1:H1"
+COST_HEADERS      = ["Product","Qty","DollarCost","AvgCostUSD","UpdatedAt"]
+COST_TABLE_RANGE  = "A1:E1"
 
 
 # =========================
@@ -64,6 +72,21 @@ def norm_amount(x) -> float:
         except: return 0.0
     return float(g(x, "value", "amount", default=0.0) or 0.0)
 
+def _parse_num(x) -> float:
+    """Robust parse: '$1,234.56', '1,234.56', plain floats."""
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = (x or "").strip()
+    if not s:
+        return 0.0
+    s = s.replace(",", "").replace("$", "")
+    if s.endswith("%"):
+        s = s[:-1]
+    try:
+        return float(s)
+    except Exception:
+        return 0.0
+
 def get_gc():
     raw = os.getenv("GOOGLE_CREDS_JSON")
     if not raw:
@@ -77,13 +100,67 @@ def _ws(gc, tab):
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=tab, rows="2000", cols="50")
 
+
+# =========================
+# Sheet helpers (anchored)
+# =========================
 def ensure_log(ws):
-    if not ws.get_all_values():
-        ws.append_row(["Timestamp","Action","Product","QuoteUSD","BaseQty","OrderID","Status","Note"])
+    vals = ws.get_values("A1:H1")
+    if not vals or vals[0] != LOG_HEADERS:
+        ws.update("A1:H1", [LOG_HEADERS])
+    try:
+        ws.freeze(rows=1)
+    except Exception:
+        pass
 
 def ensure_cost(ws):
-    if not ws.get_all_values():
-        ws.append_row(["Product","Qty","DollarCost","AvgCostUSD","UpdatedAt"])
+    vals = ws.get_values("A1:E1")
+    if not vals or vals[0] != COST_HEADERS:
+        ws.update("A1:E1", [COST_HEADERS])
+    try:
+        ws.freeze(rows=1)
+    except Exception:
+        pass
+
+def append_logs(ws, rows: List[List[str]]):
+    # Force exactly 8 columns; anchor to A:H.
+    fixed = []
+    for r in rows:
+        if len(r) < 8:   r = r + [""] * (8 - len(r))
+        elif len(r) > 8: r = r[:8]
+        fixed.append(r)
+    try:
+        for i in range(0, len(fixed), 100):
+            ws.append_rows(
+                fixed[i:i+100],
+                value_input_option="RAW",
+                table_range=LOG_TABLE_RANGE
+            )
+    except TypeError:
+        # Fallback if table_range unsupported
+        start_row = len(ws.get_all_values()) + 1
+        end_row = start_row + len(fixed) - 1
+        ws.update(f"A{start_row}:H{end_row}", fixed, value_input_option="RAW")
+
+def append_cost_rows(ws, rows: List[List[str]]):
+    # Force exactly 5 columns; anchor to A:E.
+    fixed = []
+    for r in rows:
+        if len(r) < 5:   r = r + [""] * (5 - len(r))
+        elif len(r) > 5: r = r[:5]
+        fixed.append(r)
+    try:
+        for i in range(0, len(fixed), 100):
+            ws.append_rows(
+                fixed[i:i+100],
+                value_input_option="RAW",
+                table_range=COST_TABLE_RANGE
+            )
+    except TypeError:
+        start_row = len(ws.get_all_values()) + 1
+        end_row = start_row + len(fixed) - 1
+        ws.update(f"A{start_row}:E{end_row}", fixed, value_input_option="RAW")
+
 
 def read_screener(ws) -> List[str]:
     values = ws.get_all_values()
@@ -192,8 +269,13 @@ def pick_portfolio_with_usd_if_needed() -> Optional[str]:
 def place_buy(product_id: str, usd: float) -> str:
     if DRY_RUN:
         return "DRYRUN"
-    o = CB.market_order_buy(client_order_id="", product_id=product_id, quote_size=f"{usd:.2f}")
-    return g(o, "order_id", "id", default="")
+    client_order_id = f"buy-{product_id}-{int(time.time()*1000)}"
+    o = CB.market_order_buy(
+        client_order_id=client_order_id,
+        product_id=product_id,
+        quote_size=f"{usd:.2f}"
+    )
+    return g(o, "order_id", "id", default=client_order_id)
 
 def poll_fills_sum(order_id: str) -> Dict[str, float]:
     if DRY_RUN:
@@ -227,18 +309,24 @@ def poll_fills_sum(order_id: str) -> Dict[str, float]:
 # =========================
 def upsert_cost(ws, product: str, add_qty: float, add_cost: float):
     vals = ws.get_all_values()
+    # If table has only header, vals == [header]; treat as empty.
     if vals and len(vals) > 1:
         for r in range(1, len(vals)):
-            if vals[r][0].strip().upper() == product:
-                cur_qty  = float(vals[r][1] or 0.0)
-                cur_cost = float(vals[r][2] or 0.0)
+            row = vals[r]
+            if (row[0] if row else "").strip().upper() == product:
+                cur_qty  = _parse_num(row[1] if len(row) > 1 else 0.0)
+                cur_cost = _parse_num(row[2] if len(row) > 2 else 0.0)
                 new_qty  = cur_qty + add_qty
                 new_cost = cur_cost + add_cost
                 avg = (new_cost / new_qty) if new_qty > 0 else 0.0
-                ws.update(f"A{r+1}:E{r+1}", [[product, f"{new_qty:.12f}", f"{new_cost:.2f}", f"{avg:.6f}", now_iso()]])
+                ws.update(
+                    f"A{r+1}:E{r+1}",
+                    [[product, f"{new_qty:.12f}", f"{new_cost:.2f}", f"{avg:.6f}", now_iso()]]
+                )
                 return
+    # Append (anchored to A:E)
     avg = (add_cost / add_qty) if add_qty > 0 else 0.0
-    ws.append_row([product, f"{add_qty:.12f}", f"{add_cost:.2f}", f"{avg:.6f}", now_iso()])
+    append_cost_rows(ws, [[product, f"{add_qty:.12f}", f"{add_cost:.2f}", f"{avg:.6f}", now_iso()]])
 
 
 # =========================
@@ -284,20 +372,25 @@ def main():
 
             status = "dry-run" if DRY_RUN else "submitted"
             print(f"✅ BUY {pid} ${notional:.2f} (order {oid}, {status})")
-            logs.append([now_iso(), "CRYPTO-BUY", pid, f"{notional:.2f}", f"{base_qty:.12f}" if base_qty else "", oid, status, ""])
+            logs.append([
+                now_iso(), "CRYPTO-BUY", pid,
+                f"{notional:.2f}",
+                f"{base_qty:.12f}" if base_qty else "",
+                oid, status, ""
+            ])
 
             if not DRY_RUN and base_qty > 0 and fill_usd > 0:
                 upsert_cost(ws_cost, pid, base_qty, fill_usd)
 
-            time.sleep(SLEEP_SEC)
+            # slight jitter to avoid bursty patterns
+            time.sleep(SLEEP_SEC * (0.8 + 0.4 * random.random()))
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
             print(f"❌ {pid} {msg}")
             logs.append([now_iso(), "CRYPTO-BUY-ERROR", pid, "", "", "", "ERROR", msg])
 
-    # write logs
-    for i in range(0, len(logs), 100):
-        ws_log.append_rows(logs[i:i+100], value_input_option="USER_ENTERED")
+    if logs:
+        append_logs(ws_log, logs)
     print("✅ crypto-buyer done")
 
 
