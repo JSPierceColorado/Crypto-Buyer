@@ -1,6 +1,7 @@
 import os, json, time, random
 from datetime import datetime, timezone
 from typing import List, Any, Dict, Optional
+from decimal import Decimal, ROUND_DOWN, getcontext
 
 import gspread
 from coinbase.rest import RESTClient
@@ -29,6 +30,10 @@ DEBUG_BALANCES  = os.getenv("DEBUG_BALANCES", "").lower() in ("1","true","yes")
 
 CB = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET
 
+# Decimal / rounding config
+getcontext().prec = 28
+getcontext().rounding = ROUND_DOWN
+
 # =========================
 # Sheet layout anchors
 # =========================
@@ -45,7 +50,6 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def g(obj: Any, *names: str, default=None):
-    """Get first present attr/key from an object or dict."""
     for n in names:
         if isinstance(obj, dict):
             if n in obj and obj[n] not in (None, ""):
@@ -73,7 +77,6 @@ def norm_amount(x) -> float:
     return float(g(x, "value", "amount", default=0.0) or 0.0)
 
 def _parse_num(x) -> float:
-    """Robust parse: '$1,234.56', '1,234.56', plain floats."""
     if isinstance(x, (int, float)):
         return float(x)
     s = (x or "").strip()
@@ -107,7 +110,7 @@ def _ws(gc, tab):
 def ensure_log(ws):
     vals = ws.get_values("A1:H1")
     if not vals or vals[0] != LOG_HEADERS:
-        ws.update("A1:H1", [LOG_HEADERS])
+        ws.update(range_name="A1:H1", values=[LOG_HEADERS])
     try:
         ws.freeze(rows=1)
     except Exception:
@@ -116,14 +119,13 @@ def ensure_log(ws):
 def ensure_cost(ws):
     vals = ws.get_values("A1:E1")
     if not vals or vals[0] != COST_HEADERS:
-        ws.update("A1:E1", [COST_HEADERS])
+        ws.update(range_name="A1:E1", values=[COST_HEADERS])
     try:
         ws.freeze(rows=1)
     except Exception:
         pass
 
 def append_logs(ws, rows: List[List[str]]):
-    # Force exactly 8 columns; anchor to A:H.
     fixed = []
     for r in rows:
         if len(r) < 8:   r = r + [""] * (8 - len(r))
@@ -137,13 +139,11 @@ def append_logs(ws, rows: List[List[str]]):
                 table_range=LOG_TABLE_RANGE
             )
     except TypeError:
-        # Fallback if table_range unsupported
         start_row = len(ws.get_all_values()) + 1
         end_row = start_row + len(fixed) - 1
         ws.update(f"A{start_row}:H{end_row}", fixed, value_input_option="RAW")
 
 def append_cost_rows(ws, rows: List[List[str]]):
-    # Force exactly 5 columns; anchor to A:E.
     fixed = []
     for r in rows:
         if len(r) < 5:   r = r + [""] * (5 - len(r))
@@ -181,7 +181,6 @@ def read_screener(ws) -> List[str]:
 # Coinbase – portfolios & balances
 # =========================
 def list_portfolios() -> List[Dict[str, str]]:
-    """Return list of {'id':..., 'name':...} for portfolios visible to this API key."""
     resp = CB.get_portfolios()
     items = g(resp, "portfolios") or (resp if isinstance(resp, list) else [])
     out = []
@@ -212,7 +211,6 @@ def usd_available_for_portfolio(portfolio_uuid: Optional[str]) -> float:
     return usd_total
 
 def resolve_portfolio_uuid() -> Optional[str]:
-    # Priority: explicit ID → name match → (None = use key’s default)
     if PORTFOLIO_ID:
         return PORTFOLIO_ID
     if PORTFOLIO_NAME:
@@ -222,7 +220,6 @@ def resolve_portfolio_uuid() -> Optional[str]:
     return None
 
 def debug_portfolios_and_usd():
-    """Print portfolio names + USD per portfolio (for troubleshooting)."""
     try:
         resp = CB.get_portfolios()
         items = g(resp, "portfolios") or (resp if isinstance(resp, list) else [])
@@ -240,12 +237,10 @@ def debug_portfolios_and_usd():
         print(f"[PORT] {name} id={pid} USD={usd}")
 
 def pick_portfolio_with_usd_if_needed() -> Optional[str]:
-    """Return configured portfolio id (or None for default). Prints suggestion if another portfolio has USD."""
     configured = resolve_portfolio_uuid()
     usd_cfg = usd_available_for_portfolio(configured)
     if usd_cfg > 0:
         return configured
-    # scan others
     try:
         ports = list_portfolios()
     except Exception:
@@ -258,19 +253,58 @@ def pick_portfolio_with_usd_if_needed() -> Optional[str]:
             best_id, best_usd = pid, usd
     if DEBUG_BALANCES:
         if best_usd > 0 and (configured != best_id):
-            print(f"[BAL] Suggest using portfolio {best_id} (USD {best_usd}). "
-                  f"Move USD into your key’s portfolio or reissue the key for that portfolio.")
-    return configured  # orders always route to the portfolio tied to the API key
+            print(f"[BAL] Suggest portfolio {best_id} (USD {best_usd}).")
+    return configured  # orders always use the API key’s portfolio
+
+
+# =========================
+# Helpers: retries & product rules
+# =========================
+def retry(cb_call, *args, _tries=5, _base=0.6, _j=0.4, **kwargs):
+    for i in range(_tries):
+        try:
+            return cb_call(*args, **kwargs)
+        except Exception as e:
+            msg = str(e).lower()
+            if any(x in msg for x in ("429", "rate limit", "timeout", "temporarily", "5", "service")):
+                sleep = _base * (2 ** i) * (0.8 + _j * random.random())
+                time.sleep(sleep)
+                continue
+            raise
+    return cb_call(*args, **kwargs)
+
+def quantize_down(x: float, step: float) -> float:
+    q = Decimal(str(step))
+    return float(Decimal(str(x)).quantize(q))
+
+def fetch_product_rules(pid: str):
+    meta = retry(CB.get_product, product_id=pid)
+    base_inc = float(g(meta, "base_increment", "base_size_increment", "base_min_size", default=1e-8))
+    quote_inc = float(g(meta, "quote_increment", "quote_size_increment", "quote_min_size", default=0.01))
+    min_quote = float(g(meta, "min_market_funds", "quote_min_size", "min_funds", default=1.00))
+    min_base  = float(g(meta, "min_order_size", "base_min_size", default=1e-8))
+    return base_inc, quote_inc, min_quote, min_base
 
 
 # =========================
 # Orders & fills (NO portfolio_uuid)
 # =========================
+def _fees_sum(fills: list) -> float:
+    total_fee = 0.0
+    for x in fills:
+        fx = g(x, "fee", "fees", "commission", default=0.0)
+        try: total_fee += float(fx)
+        except: pass
+    return total_fee
+
 def place_buy(product_id: str, usd: float) -> str:
     if DRY_RUN:
         return "DRYRUN"
+    _, quote_inc, min_quote, _ = fetch_product_rules(product_id)
+    usd = max(min_quote, quantize_down(usd, quote_inc))
     client_order_id = f"buy-{product_id}-{int(time.time()*1000)}"
-    o = CB.market_order_buy(
+    o = retry(
+        CB.market_order_buy,
         client_order_id=client_order_id,
         product_id=product_id,
         quote_size=f"{usd:.2f}"
@@ -282,7 +316,7 @@ def poll_fills_sum(order_id: str) -> Dict[str, float]:
         return {"base_qty": 0.0, "fill_usd": 0.0}
     for _ in range(POLL_TRIES):
         try:
-            f = CB.get_fills(order_id=order_id)  # no portfolio param allowed for orders
+            f = retry(CB.get_fills, order_id=order_id)
             fills = g(f, "fills") or (f if isinstance(f, list) else [])
             if fills:
                 base_qty = 0.0
@@ -296,8 +330,9 @@ def poll_fills_sum(order_id: str) -> Dict[str, float]:
                         px = float(g(x, "price", default=0) or 0)
                         fill_usd += px * sz
                     base_qty += sz
+                fee = _fees_sum(fills)      # fee increases cost
                 if base_qty > 0 and fill_usd > 0:
-                    return {"base_qty": base_qty, "fill_usd": fill_usd}
+                    return {"base_qty": base_qty, "fill_usd": max(0.0, fill_usd + fee)}
         except Exception:
             pass
         time.sleep(POLL_SEC)
@@ -309,7 +344,6 @@ def poll_fills_sum(order_id: str) -> Dict[str, float]:
 # =========================
 def upsert_cost(ws, product: str, add_qty: float, add_cost: float):
     vals = ws.get_all_values()
-    # If table has only header, vals == [header]; treat as empty.
     if vals and len(vals) > 1:
         for r in range(1, len(vals)):
             row = vals[r]
@@ -320,11 +354,10 @@ def upsert_cost(ws, product: str, add_qty: float, add_cost: float):
                 new_cost = cur_cost + add_cost
                 avg = (new_cost / new_qty) if new_qty > 0 else 0.0
                 ws.update(
-                    f"A{r+1}:E{r+1}",
-                    [[product, f"{new_qty:.12f}", f"{new_cost:.2f}", f"{avg:.6f}", now_iso()]]
+                    range_name=f"A{r+1}:E{r+1}",
+                    values=[[product, f"{new_qty:.12f}", f"{new_cost:.2f}", f"{avg:.6f}", now_iso()]]
                 )
                 return
-    # Append (anchored to A:E)
     avg = (add_cost / add_qty) if add_qty > 0 else 0.0
     append_cost_rows(ws, [[product, f"{add_qty:.12f}", f"{add_cost:.2f}", f"{avg:.6f}", now_iso()]])
 
@@ -347,20 +380,24 @@ def main():
     if DEBUG_BALANCES:
         debug_portfolios_and_usd()
 
-    # pick portfolio (for balance reads only — orders use the API key’s portfolio)
     portfolio_uuid = pick_portfolio_with_usd_if_needed()
-
-    # compute notional from that portfolio’s USD
     usd_bal = usd_available_for_portfolio(portfolio_uuid)
     if DEBUG_BALANCES:
         print(f"[BAL] Using portfolio {portfolio_uuid or '(key default)'} with USD {usd_bal}")
 
+    remaining_usd = usd_bal
     logs = []
+
     for i, pid in enumerate(products, 1):
         try:
-            notional = usd_bal * (PCT_PER_TRADE / 100.0)
-            if notional < MIN_NOTIONAL:
-                note = f"Notional ${notional:.2f} < ${MIN_NOTIONAL:.2f}"
+            # planned notional from remaining balance
+            notional = remaining_usd * (PCT_PER_TRADE / 100.0)
+
+            # pre-check min_quote to avoid noisy rejections
+            _, _, min_quote, _ = fetch_product_rules(pid)
+            min_required = max(MIN_NOTIONAL, min_quote)
+            if notional < min_required:
+                note = f"Notional ${notional:.2f} < min ${min_required:.2f}"
                 print(f"⚠️ {pid} {note}")
                 logs.append([now_iso(), "CRYPTO-BUY-SKIP", pid, f"{notional:.2f}", "", "", "SKIPPED", note])
                 continue
@@ -369,6 +406,9 @@ def main():
             fills = poll_fills_sum(oid)
             base_qty = fills["base_qty"]
             fill_usd = fills["fill_usd"] if fills["fill_usd"] > 0 else notional
+
+            # decrement remaining by actual USD used (or planned if unknown)
+            remaining_usd = max(0.0, remaining_usd - (fill_usd or notional))
 
             status = "dry-run" if DRY_RUN else "submitted"
             print(f"✅ BUY {pid} ${notional:.2f} (order {oid}, {status})")
@@ -382,7 +422,6 @@ def main():
             if not DRY_RUN and base_qty > 0 and fill_usd > 0:
                 upsert_cost(ws_cost, pid, base_qty, fill_usd)
 
-            # slight jitter to avoid bursty patterns
             time.sleep(SLEEP_SEC * (0.8 + 0.4 * random.random()))
         except Exception as e:
             msg = f"{type(e).__name__}: {e}"
