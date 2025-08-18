@@ -1,41 +1,49 @@
-import os, json, time, math
-from datetime import datetime, timedelta, timezone
-from typing import List, Any, Tuple, Optional
+import os, json, time, random
+from datetime import datetime, timezone
+from typing import List, Any, Dict, Optional
 
 import gspread
-import pandas as pd
-import numpy as np
-from coinbase.rest import RESTClient  # coinbase-advanced-py
+from coinbase.rest import RESTClient
 
-# ============== Config ==============
-SHEET_NAME        = os.getenv("SHEET_NAME", "Trading Log")
-PRODUCTS_TAB      = os.getenv("CRYPTO_PRODUCTS_TAB", "crypto_products")
-SCREENER_TAB      = os.getenv("CRYPTO_SCREENER_TAB", "crypto_screener")
+# =========================
+# Config (env or defaults)
+# =========================
+SHEET_NAME   = os.getenv("SHEET_NAME", "Trading Log")
+SCREENER_TAB = os.getenv("CRYPTO_SCREENER_TAB", "crypto_screener")
+LOG_TAB      = os.getenv("CRYPTO_LOG_TAB", "crypto_log")
 
-LOOKBACK_4H       = int(os.getenv("LOOKBACK_4H", "220"))                # 4h bars fetched
-MIN_24H_NOTIONAL  = float(os.getenv("MIN_24H_NOTIONAL", "2000000"))     # USD (baseline)
-RSI_MIN           = float(os.getenv("RSI_MIN", "50"))
-RSI_MAX           = float(os.getenv("RSI_MAX", "65"))
-MAX_EXT_EMA20_PCT = float(os.getenv("MAX_EXT_EMA20_PCT", "0.08"))       # 8% cap
-REQUIRE_7D_HIGH   = os.getenv("REQUIRE_7D_HIGH", "true").lower() in ("1","true","yes")
+PCT_PER_TRADE = float(os.getenv("PERCENT_PER_TRADE", "5.0"))
+MIN_NOTIONAL  = float(os.getenv("MIN_ORDER_NOTIONAL", "1.00"))
+SLEEP_SEC     = float(os.getenv("SLEEP_BETWEEN_ORDERS_SEC", "0.8"))
+POLL_SEC      = float(os.getenv("POLL_INTERVAL_SEC", "0.8"))
+POLL_TRIES    = int(os.getenv("POLL_MAX_TRIES", "25"))
 
-# New: regime + ranking controls
-REGIME_GUARD      = os.getenv("REGIME_GUARD", "true").lower() in ("1","true","yes")
-TOP_N             = int(os.getenv("TOP_N", "20"))                        # keep best N picks
-RS_LOOKBACK       = int(os.getenv("RS_LOOKBACK", "14"))                  # 14 x 4h ~ 2.3 days
-VOLATILITY_PCT_MIN= float(os.getenv("VOLATILITY_PCT_MIN", "0.03"))       # ATR14/EMA20 ≥ 3%
-VOL_EXPANSION_MULT= float(os.getenv("VOL_EXPANSION_MULT", "1.20"))       # latest 24h vs prior median
-MICRO_PRICE       = float(os.getenv("MICRO_PRICE", "0.10"))              # sub-10c = stricter
-MICRO_NOTIONAL_MIN= float(os.getenv("MICRO_NOTIONAL_MIN", "10000000"))   # 10M for micro price
-STRICT_MICRO      = os.getenv("STRICT_MICRO", "true").lower() in ("1","true","yes")
+# Auto-convert support (within API key's portfolio only)
+AUTO_CONVERT       = os.getenv("AUTO_CONVERT", "true").lower() in ("1","true","yes")
+CONVERT_FROM_CCY   = os.getenv("CONVERT_FROM_CCY", "USDC").upper()
+CONVERT_TO_CCY     = os.getenv("CONVERT_TO_CCY", "USD").upper()
+CONVERT_PAD_PCT    = float(os.getenv("CONVERT_PAD_PCT", "1.0"))  # convert 1% extra to be safe
 
-PER_PRODUCT_SLEEP = float(os.getenv("PER_PRODUCT_SLEEP", "0.05"))        # polite throttle (sec)
+# Debug / safety
+DRY_RUN         = os.getenv("DRY_RUN", "").lower() in ("1","true","yes")
+DEBUG_BALANCES  = os.getenv("DEBUG_BALANCES", "").lower() in ("1","true","yes")
 
-# ============== Small utils ==============
+CB = RESTClient()  # reads COINBASE_API_KEY / COINBASE_API_SECRET
+
+# =========================
+# Sheet layout anchors
+# =========================
+LOG_HEADERS       = ["Timestamp","Action","Product","QuoteUSD","BaseQty","OrderID","Status","Note"]
+LOG_TABLE_RANGE   = "A1:H1"
+
+# =========================
+# Utils
+# =========================
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def g(obj: Any, *names: str, default=None):
+    """Get first present attr/key from an object or dict."""
     for n in names:
         if isinstance(obj, dict):
             if n in obj and obj[n] not in (None, ""):
@@ -46,292 +54,247 @@ def g(obj: Any, *names: str, default=None):
                 return v
     return default
 
-def _floor_to_4h(dt_utc: datetime) -> datetime:
-    dt_utc = dt_utc.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    return dt_utc.replace(hour=(dt_utc.hour // 4) * 4)
+def parse_amount(x) -> float:
+    """Accept float/int/str or {'value': '...'} shapes."""
+    if x is None:
+        return 0.0
+    if isinstance(x, dict):
+        v = g(x, "value", "amount")
+        try: return float(v or 0.0)
+        except: return 0.0
+    try:
+        return float(x)
+    except:
+        return 0.0
 
-# ============== Sheets helpers ==============
-def get_google_client():
+def norm_ccy(c) -> str:
+    if c is None: return ""
+    if isinstance(c, str): return c.upper()
+    return (g(c, "code", "currency", "symbol", "base", default="") or "").upper()
+
+def get_gc():
     raw = os.getenv("GOOGLE_CREDS_JSON")
     if not raw:
         raise RuntimeError("Missing GOOGLE_CREDS_JSON")
     return gspread.service_account_from_dict(json.loads(raw))
 
-def _get_ws(gc, tab_name: str):
+def _ws(gc, tab):
     sh = gc.open(SHEET_NAME)
     try:
-        return sh.worksheet(tab_name)
+        return sh.worksheet(tab)
     except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=tab_name, rows="2000", cols="50")
+        return sh.add_worksheet(title=tab, rows="2000", cols="50")
 
-def write_products(ws, products: List[str]):
-    ws.clear()
-    ws.append_row(["Product"])
-    if products:
-        ws.append_rows([[p] for p in products], value_input_option="USER_ENTERED")
+# =========================
+# Sheet helpers
+# =========================
+def ensure_log(ws):
+    vals = ws.get_values("A1:H1")
+    if not vals or vals[0] != LOG_HEADERS:
+        ws.update("A1:H1", [LOG_HEADERS])
+    try:
+        ws.freeze(rows=1)
+    except Exception:
+        pass
 
-def write_screener(ws, rows: List[List[Any]]):
-    ws.clear()
-    headers = [
-        "Product","Price","EMA_20","SMA_50","RSI_14",
-        "MACD","Signal","MACD_Hist","MACD_Hist_Δ",
-        "Vol24hUSD","7D_High","Breakout","Bullish Signal",
-        "RS14","ROC14","Score","Buy Reason","Timestamp"
-    ]
-    ws.append_row(headers)
-    for i in range(0, len(rows), 100):
-        ws.append_rows(rows[i:i+100], value_input_option="USER_ENTERED")
+def append_logs(ws, rows: List[List[str]]):
+    # Force exactly 8 columns; anchor to A:H.
+    fixed = []
+    for r in rows:
+        if len(r) < 8:   r = r + [""] * (8 - len(r))
+        elif len(r) > 8: r = r[:8]
+        fixed.append(r)
+    try:
+        for i in range(0, len(fixed), 100):
+            ws.append_rows(
+                fixed[i:i+100],
+                value_input_option="RAW",
+                table_range=LOG_TABLE_RANGE
+            )
+    except TypeError:
+        start_row = len(ws.get_all_values()) + 1
+        end_row = start_row + len(fixed) - 1
+        ws.update(f"A{start_row}:H{end_row}", fixed, value_input_option="RAW")
 
-# ============== Coinbase helpers ==============
-CB = RESTClient()
-
-def all_usd_products() -> List[str]:
-    prods = []
-    cursor = None
-    while True:
-        resp = CB.get_products(limit=250, cursor=cursor) if cursor else CB.get_products(limit=250)
-        products = g(resp, "products") or (resp if isinstance(resp, list) else [])
-        for p in products:
-            pid = g(p, "product_id", "productId", "id")
-            if not pid:
-                base = g(p, "base_currency", "baseCurrency", "base")
-                quote = g(p, "quote_currency", "quoteCurrency", "quote")
-                if base and quote:
-                    pid = f"{base}-{quote}"
-            status = (g(p, "status", "trading_status", "tradingStatus", default="") or "").upper()
-            if pid and pid.endswith("-USD") and status == "ONLINE":
-                prods.append(pid)
-        cursor = g(resp, "cursor")
-        if not cursor:
+def read_screener(ws) -> List[str]:
+    values = ws.get_all_values()
+    if not values or len(values) < 2:
+        return []
+    header = [h.strip() for h in values[0]]
+    # Prefer "Product" but accept common fallbacks
+    possible = ["Product","product","Ticker","Symbol"]
+    idx = 0
+    for name in possible:
+        if name in header:
+            idx = header.index(name)
             break
-    return sorted(dict.fromkeys(prods))
+    out, seen = [], set()
+    for r in values[1:]:
+        if idx < len(r):
+            pid = (r[idx] or "").strip().upper()
+            if pid and pid.endswith("-USD") and pid not in seen:
+                seen.add(pid); out.append(pid)
+    return out
 
-def get_candles_4h(product_id: str, bars: int) -> pd.DataFrame:
-    end_dt = _floor_to_4h(datetime.now(timezone.utc))
-    start_dt = end_dt - timedelta(hours=bars * 4)
-    resp = CB.get_candles(
-        product_id=product_id,
-        start=int(start_dt.timestamp()),
-        end=int(end_dt.timestamp()),
-        granularity="FOUR_HOUR",
-    )
-    rows = g(resp, "candles") or (resp if isinstance(resp, list) else [])
-    out = []
-    for c in rows:
-        out.append({
-            "start":  g(c, "start"),
-            "open":   float(g(c, "open",   default=0) or 0),
-            "high":   float(g(c, "high",   default=0) or 0),
-            "low":    float(g(c, "low",    default=0) or 0),
-            "close":  float(g(c, "close",  default=0) or 0),
-            "volume": float(g(c, "volume", default=0) or 0),
-        })
-    if not out:
-        return pd.DataFrame()
-    df = pd.DataFrame(out).sort_values("start")
-    return df.tail(bars).reset_index(drop=True)
+# =========================
+# Coinbase helpers
+# =========================
+def list_accounts() -> List[Dict[str, Any]]:
+    resp = CB.get_accounts()
+    return g(resp, "accounts") or (resp if isinstance(resp, list) else [])
 
-# ============== Indicators ==============
-def ema(s, w): return s.ewm(span=w, adjust=False).mean()
-def sma(s, w): return s.rolling(w).mean()
+def usd_usdc_balances() -> Dict[str, float]:
+    """Return {'USD': amt, 'USDC': amt} in the key's portfolio."""
+    usd = 0.0; usdc = 0.0
+    for a in list_accounts():
+        ccy = norm_ccy(g(a, "currency", "asset", "currency_symbol"))
+        avail = parse_amount(g(a, "available_balance", "available", "balance", "available_balance_value"))
+        if ccy == "USD":  usd += avail
+        if ccy == "USDC": usdc += avail
+    if DEBUG_BALANCES:
+        print(f"[BAL] USD={usd:.2f} USDC={usdc:.2f}")
+    return {"USD": usd, "USDC": usdc}
 
-def rsi(series, window=14):
-    delta = series.diff()
-    up = delta.clip(lower=0); down = -delta.clip(upper=0)
-    avg_gain = up.ewm(alpha=1/window, adjust=False).mean()
-    avg_loss = down.ewm(alpha=1/window, adjust=False).mean().replace(0, np.nan)
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-def macd(series, fast=12, slow=26, signal=9):
-    ef = ema(series, fast); es = ema(series, slow)
-    line = ef - es; sig = ema(line, signal)
-    hist = line - sig
-    return line, sig, hist
-
-def atr(df: pd.DataFrame, w: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = pd.concat([(h-l).abs(), (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
-    return tr.rolling(window=w, min_periods=w).mean()
-
-# ============== Regime guard ==============
-def regime_ok() -> Tuple[bool, str]:
-    btc = get_candles_4h("BTC-USD", LOOKBACK_4H)
-    eth = get_candles_4h("ETH-USD", LOOKBACK_4H)
-    if btc.empty or eth.empty or len(btc) < 60 or len(eth) < 60:
-        return False, "insufficient BTC/ETH data"
-
-    def _ok(df):
-        close = pd.to_numeric(df["close"]); e20 = ema(close,20); s50 = sma(close,50)
-        m_line, m_sig, m_hist = macd(close)
-        cond = (close.iloc[-1] > e20.iloc[-1] > s50.iloc[-1]) \
-               and (m_line.iloc[-1] > m_sig.iloc[-1]) \
-               and (e20.iloc[-1] > e20.iloc[-2])
-        return bool(cond)
-
-    if _ok(btc) and _ok(eth):
-        return True, "BTC/ETH uptrend (4h)"
-    return False, "BTC/ETH not aligned up (4h)"
-
-# ============== Analyze one ==============
-def analyze(pid: str, btc_close: Optional[pd.Series]) -> Optional[List[Any]]:
-    df = get_candles_4h(pid, LOOKBACK_4H)
-    if df.empty or df.shape[0] < 60:
+def convert_ccy(from_ccy: str, to_ccy: str, amount: float) -> Optional[str]:
+    """
+    Try to convert from_ccy -> to_ccy within this portfolio.
+    Returns conversion id / client id if successful; None otherwise.
+    """
+    if DRY_RUN:
+        return "DRYRUN-CONVERT"
+    if amount <= 0:
         return None
-
-    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
-    vol   = pd.to_numeric(df["volume"], errors="coerce").astype(float)
-    high  = pd.to_numeric(df["high"], errors="coerce").astype(float)
-    low   = pd.to_numeric(df["low"],  errors="coerce").astype(float)
-
-    price = float(close.iloc[-1])
-    ema20s= ema(close, 20); ema20 = float(ema20s.iloc[-1])
-    sma50 = float(sma(close, 50).iloc[-1])
-    rsi14 = float(rsi(close, 14).iloc[-1])
-
-    macd_line, macd_sig, macd_hist = macd(close)
-    macd_v    = float(macd_line.iloc[-1])
-    signal_v  = float(macd_sig.iloc[-1])
-    hist_v    = float(macd_hist.iloc[-1])
-    hist_prev = float(macd_hist.iloc[-2]) if macd_hist.shape[0] >= 2 else np.nan
-    hist_delta= hist_v - hist_prev if not math.isnan(hist_prev) else np.nan
-
-    # 24h notional = sum of last 6x4h (close * volume)
-    vol24_usd = float((close.tail(6) * vol.tail(6)).sum())
-
-    # Volume expansion: compare last 24h to median of prior 5x24h windows
-    roll_24 = (close * vol).rolling(6).sum()
-    prev_median = float(roll_24.iloc[-7:-1].rolling(6).sum().median()) if len(roll_24) >= 12 else 0.0
-    vol_exp_ok = (prev_median == 0.0) or (roll_24.iloc[-1] >= VOL_EXPANSION_MULT * prev_median)
-
-    # 7D high (42 x 4h bars)
-    high_7d = float(close.tail(42).max())
-    breakout = price >= high_7d - 1e-9 if REQUIRE_7D_HIGH else (price >= close.tail(20).max() - 1e-9)
-
-    # Volatility filter (skip stables/chop): ATR14 / EMA20
-    a14 = atr(pd.DataFrame({"high":high,"low":low,"close":close}), 14)
-    atr_pct = float(a14.iloc[-1] / max(1e-12, ema20)) if not a14.isna().iloc[-1] else 0.0
-    if atr_pct < VOLATILITY_PCT_MIN:
-        return None
-
-    # Base filters
-    if not (price > ema20 > sma50):
-        return None
-    if (price / ema20 - 1.0) > MAX_EXT_EMA20_PCT:
-        return None
-    if not (RSI_MIN < rsi14 < RSI_MAX):
-        return None
-    if not (macd_v > signal_v and hist_v > 0 and (not math.isnan(hist_delta) and hist_delta > 0)):
-        return None
-    if vol24_usd < MIN_24H_NOTIONAL:
-        return None
-    if REQUIRE_7D_HIGH and not breakout:
-        return None
-    if not vol_exp_ok:
-        return None
-
-    # Micro-price stricter path
-    if STRICT_MICRO and price < MICRO_PRICE:
-        if vol24_usd < MICRO_NOTIONAL_MIN:
+    try:
+        # The Advanced Trade API supports a conversions endpoint.
+        # The exact method name can vary by SDK; try common ones defensively.
+        if hasattr(CB, "create_conversion"):
+            res = CB.create_conversion(from_ccy=from_ccy, to_ccy=to_ccy, amount=f"{amount:.2f}")
+        elif hasattr(CB, "convert_currency"):
+            res = CB.convert_currency(from_ccy=from_ccy, to_ccy=to_ccy, amount=f"{amount:.2f}")
+        else:
+            print("[CONVERT] Conversion method not available in this SDK.")
             return None
+        cid = g(res, "conversion_id", "id", "client_id", default=None)
+        print(f"[CONVERT] {from_ccy}->{to_ccy} ${amount:.2f} id={cid}")
+        # Give Coinbase a moment to settle balances
+        time.sleep(1.0)
+        return cid or "CONVERTED"
+    except Exception as e:
+        print(f"[CONVERT] error: {e}")
+        return None
 
-    # Relative strength vs BTC (if available)
-    RS14 = ROC14 = 0.0
-    if btc_close is not None and len(btc_close) == len(close):
-        # align lengths if needed
-        n = min(len(btc_close), len(close))
-        c = close.tail(n).reset_index(drop=True)
-        b = pd.to_numeric(btc_close.tail(n)).reset_index(drop=True)
-        if n > RS_LOOKBACK:
-            ROC14 = float(c.iloc[-1] / c.iloc[-1-RS_LOOKBACK] - 1.0)
-            BTC_ROC14 = float(b.iloc[-1] / b.iloc[-1-RS_LOOKBACK] - 1.0)
-            RS14 = ROC14 - BTC_ROC14
-
-    # Simple composite score: weight RS over raw momentum
-    score = 100.0 * (0.6 * RS14 + 0.4 * ROC14)
-
-    reason = (
-        f"4h Uptrend (P>EMA20>SMA50), RSI {RSI_MIN}-{RSI_MAX}, "
-        f"MACD>Signal & Hist↑, ≤{int(MAX_EXT_EMA20_PCT*100)}% above EMA20, "
-        f"24h notional ≥ ${int(MIN_24H_NOTIONAL):,}"
-        + (" + 7D breakout" if REQUIRE_7D_HIGH else "")
-        + (f", volExp≥{VOL_EXPANSION_MULT}x" if VOL_EXPANSION_MULT>1.0 else "")
+def place_buy(product_id: str, usd: float) -> str:
+    if DRY_RUN:
+        return "DRYRUN"
+    client_order_id = f"buy-{product_id}-{int(time.time()*1000)}"
+    o = CB.market_order_buy(
+        client_order_id=client_order_id,
+        product_id=product_id,
+        quote_size=f"{usd:.2f}"
     )
+    return g(o, "order_id", "id", default=client_order_id)
 
-    row = [
-        pid,
-        round(price, 6),
-        round(ema20, 6),
-        round(sma50, 6),
-        round(rsi14, 2),
-        round(macd_v, 6),
-        round(signal_v, 6),
-        round(hist_v, 6),
-        round(hist_delta, 6) if not math.isnan(hist_delta) else "",
-        int(vol24_usd),
-        round(high_7d, 6),
-        "✅" if breakout else "",
-        "✅",
-        round(RS14, 6),
-        round(ROC14, 6),
-        round(score, 4),
-        reason,
-        now_iso(),
-    ]
-    return row
+def poll_fills_sum(order_id: str) -> Dict[str, float]:
+    if DRY_RUN:
+        return {"base_qty": 0.0, "fill_usd": 0.0}
+    for _ in range(POLL_TRIES):
+        try:
+            f = CB.get_fills(order_id=order_id)  # orders tied to key's portfolio
+            fills = g(f, "fills") or (f if isinstance(f, list) else [])
+            if fills:
+                base_qty = 0.0
+                fill_usd = 0.0
+                for x in fills:
+                    sz = parse_amount(g(x, "size", "filled_quantity"))
+                    qv = g(x, "quote_value", "commissionable_value")
+                    if qv is not None:
+                        fill_usd += parse_amount(qv)
+                    else:
+                        px = parse_amount(g(x, "price"))
+                        fill_usd += px * sz
+                    base_qty += sz
+                if base_qty > 0 and fill_usd > 0:
+                    return {"base_qty": base_qty, "fill_usd": fill_usd}
+        except Exception:
+            pass
+        time.sleep(POLL_SEC)
+    return {"base_qty": 0.0, "fill_usd": 0.0}
 
-# ============== Main ==============
+# =========================
+# Main
+# =========================
 def main():
-    print("🚀 crypto-finder starting (regime + RS ranking)")
-    gc = get_google_client()
-    ws_products = _get_ws(gc, PRODUCTS_TAB)
-    ws_screener = _get_ws(gc, SCREENER_TAB)
+    print("🛒 crypto-buyer starting")
+    gc = get_gc()
+    ws_scr = _ws(gc, SCREENER_TAB)
+    ws_log = _ws(gc, LOG_TAB);  ensure_log(ws_log)
 
-    products = all_usd_products()
-    write_products(ws_products, products)
-    print(f"📦 ONLINE USD products: {len(products)}")
+    products = read_screener(ws_scr)
+    if not products:
+        print("ℹ️ No products in screener; exiting.")
+        return
 
-    # Regime guard (BTC & ETH on 4h)
-    if REGIME_GUARD:
-        ok, why = regime_ok()
-        print(f"🛡️  Regime: {why} | allowed={ok}")
-        if not ok:
-            write_screener(ws_screener, [])
-            print("ℹ️ Regime guard blocking buys; screener cleared.")
-            return
+    # Starting balances
+    bal = usd_usdc_balances()
+    usd_budget = bal["USD"]
+    usdc_bal   = bal["USDC"]
 
-    # Pre-fetch BTC close for RS comparison
-    btc_df = get_candles_4h("BTC-USD", LOOKBACK_4H)
-    btc_close = pd.to_numeric(btc_df["close"]).reset_index(drop=True) if not btc_df.empty else None
+    logs = []
 
-    rows = []
     for i, pid in enumerate(products, 1):
         try:
-            r = analyze(pid, btc_close if btc_close is not None else None)
-            if r:
-                rows.append(r)
+            # Recompute per-trade notional from CURRENT budget
+            notional = usd_budget * (PCT_PER_TRADE / 100.0)
+
+            if notional < MIN_NOTIONAL:
+                # Attempt on-demand USDC->USD conversion if enabled
+                if AUTO_CONVERT and usdc_bal > 0 and (MIN_NOTIONAL - notional) > 0:
+                    need = (MIN_NOTIONAL - notional) * (1 + CONVERT_PAD_PCT/100.0)
+                    conv_amt = min(max(need, 0.0), usdc_bal)
+                    if conv_amt >= 0.50:  # avoid dust conversions
+                        convert_ccy(CONVERT_FROM_CCY, CONVERT_TO_CCY, conv_amt)
+                        # Refresh balances/budget after conversion
+                        bal = usd_usdc_balances()
+                        usd_budget = bal["USD"]
+                        usdc_bal   = bal["USDC"]
+                        notional   = usd_budget * (PCT_PER_TRADE / 100.0)
+
+            if notional < MIN_NOTIONAL:
+                note = f"Notional ${notional:.2f} < ${MIN_NOTIONAL:.2f}"
+                print(f"⚠️ {pid} {note}")
+                logs.append([now_iso(), "CRYPTO-BUY-SKIP", pid, f"{notional:.2f}", "", "", "SKIPPED", note])
+                continue
+
+            # Clamp notional to what's actually left in USD
+            notional = min(notional, usd_budget)
+
+            oid = place_buy(pid, notional)
+            fills = poll_fills_sum(oid)
+            base_qty = fills["base_qty"]
+            fill_usd = fills["fill_usd"] if fills["fill_usd"] > 0 else notional
+
+            status = "dry-run" if DRY_RUN else "submitted"
+            print(f"✅ BUY {pid} ${notional:.2f} (order {oid}, {status})")
+            logs.append([
+                now_iso(), "CRYPTO-BUY", pid,
+                f"{notional:.2f}",
+                f"{base_qty:.12f}" if base_qty else "",
+                oid, status, ""
+            ])
+
+            # Reduce USD budget by what we just spent (estimate by fill_usd)
+            usd_budget = max(0.0, usd_budget - fill_usd)
+
+            # slight jitter to avoid bursty patterns
+            time.sleep(SLEEP_SEC * (0.8 + 0.4 * random.random()))
         except Exception as e:
-            print(f"⚠️ {pid} analyze error: {e}")
-        if i % 20 == 0:
-            print(f"   • analyzed {i}/{len(products)}")
-        time.sleep(PER_PRODUCT_SLEEP)
+            msg = f"{type(e).__name__}: {e}"
+            print(f"❌ {pid} {msg}")
+            logs.append([now_iso(), "CRYPTO-BUY-ERROR", pid, "", "", "", "ERROR", msg])
 
-    # Rank by Score desc and keep top N
-    if rows:
-        df = pd.DataFrame(rows, columns=[
-            "Product","Price","EMA_20","SMA_50","RSI_14",
-            "MACD","Signal","MACD_Hist","MACD_Hist_Δ",
-            "Vol24hUSD","7D_High","Breakout","Bullish Signal",
-            "RS14","ROC14","Score","Buy Reason","Timestamp"
-        ])
-        df = df.sort_values("Score", ascending=False).head(max(1, TOP_N))
-        rows = df.values.tolist()
-    else:
-        rows = []
-
-    write_screener(ws_screener, rows)
-    print(f"✅ Screener wrote {len(rows)} picks to {SCREENER_TAB}")
+    if logs:
+        append_logs(ws_log, logs)
+    print("✅ crypto-buyer done")
 
 if __name__ == "__main__":
     try:
